@@ -5,7 +5,7 @@ use cosmwasm_std::{from_json, Addr, Decimal, DepsMut, Env, Fraction, MessageInfo
 use crate::contract::get_tftoken;
 use crate::{ContractError, ContractResult};
 use crate::msg::{Cw20ReceivePayload, ExecuteMsg, UpdateMetadataMsg};
-use crate::state::{Asset, Component, COMPONENTS, STATE, WITHDRAWAL_TAXES};
+use crate::state::{Asset, Component, COMPONENTS, STATE, BALANCES};
 
 use amalgam_utils::tokenfactory::{DenomMetadata, DenomUnit, TFToken};
 
@@ -134,6 +134,11 @@ fn deposit_cw20(ctx: &mut ExecuteContext, token_contract: Addr, amount: Uint128,
 
 fn deposit(ctx: &mut ExecuteContext, component: Component, amount: Uint128, recipient: String) -> ContractResult<Response> {
   let tftoken = get_tftoken(&ctx.env);
+
+  BALANCES.update(ctx.deps.storage, component.token.key(), |balance| -> Result<Uint128, ContractError> {
+    Ok(balance.unwrap_or(Uint128::zero()) + amount)
+  })?;
+
   Ok(Response::new()
     .add_attribute("action", "deposit")
     .add_messages(tftoken.mint(
@@ -163,40 +168,50 @@ fn withdraw(ctx: &mut ExecuteContext, asset: Asset) -> ContractResult<Response> 
 
   let withdrawal_tax_decimal = Decimal::from_ratio(component.withdrawal_tax as u64, 10000u64);
 
-  // invert mint weight
-  let amount = fund.amount * Decimal::inv(&component.weight).unwrap();
-  // compute withdrawal tax
-  let tax = amount * withdrawal_tax_decimal;
-  // apply withdrawal tax & subtract one to make sure we don't run out of funds due to precision loss
-  let amount = amount - tax - Uint128::one();
+  let amount_gross = fund.amount * Decimal::inv(&component.weight).unwrap();
 
-  // update collected withdrawal taxes
-  WITHDRAWAL_TAXES.update(ctx.deps.storage, asset.key(), |fees| -> Result<Uint128, ContractError> {
-    Ok(fees.unwrap_or(Uint128::zero()) + tax)
+  let tax = amount_gross * withdrawal_tax_decimal;
+
+  // apply withdrawal tax & subtract one to make sure we don't run out of funds due to precision loss
+  let amount_net = amount_gross - tax - Uint128::one();
+
+  // note: we need to subtract the gross amount from the balance, not the net amount
+  // this causes surplus between the actual balance and the tracked balance
+  // that we can then withdraw as taxes later to bring them back in line
+  BALANCES.update(ctx.deps.storage, asset.key(), |balance| -> Result<Uint128, ContractError> {
+    match balance {
+      Some(balance) => {
+        if balance < amount_gross {
+          return Err(ContractError::InsufficientBalance);
+        }
+        Ok(balance - amount_gross)
+      },
+      None =>
+        Err(ContractError::InsufficientBalance),
+    }
   })?;
 
   Ok(Response::new()
     .add_attribute("action", "withdraw")
     // burn the sent tokens
     .add_messages(tftoken.burn(fund.amount, ctx.env.contract.address.to_string()))
-    .add_message(asset.send(amount, ctx.info.sender.to_string()))
+    .add_message(asset.send(amount_net, ctx.info.sender.to_string()))
   )
 }
 
 fn collect_taxes(ctx: &mut ExecuteContext, asset: Asset) -> ContractResult<Response> {
   let admin = helpers::assert_admin(ctx)?;
 
-  let taxes = WITHDRAWAL_TAXES.may_load(ctx.deps.storage, asset.key())?;
-  if taxes.is_none() {
+  let balance_actual = asset.balance(&ctx.deps.as_ref(), &ctx.deps.querier, ctx.info.sender.clone());
+  let balance_tracked = BALANCES.may_load(ctx.deps.storage, asset.key())?.unwrap_or(Uint128::zero());
+
+  if balance_actual <= balance_tracked {
     return Err(ContractError::NoTaxes);
   }
-  let taxes = taxes.unwrap();
-
-  WITHDRAWAL_TAXES.remove(ctx.deps.storage, asset.key());
 
   Ok(Response::new()
     .add_attribute("action", "collect_taxes")
-    .add_message(asset.send(taxes, admin.to_string()))
+    .add_message(asset.send(balance_actual - balance_tracked, admin.to_string()))
   )
 }
 
@@ -333,12 +348,12 @@ mod tests {
     let res = execute(deps.as_mut(), env.clone(), info.clone(), msg.clone());
     assert!(matches!(res, Err(ContractError::NoTaxes)));
 
-    WITHDRAWAL_TAXES.save(deps.as_mut().storage, "native:utest".to_string(), &Uint128::from(1000u64)).unwrap();
+    BALANCES.save(deps.as_mut().storage, "native:utest".to_string(), &Uint128::from(1000u64)).unwrap();
 
     let res = execute(deps.as_mut(), env.clone(), info.clone(), msg);
     assert!(matches!(res, Ok(_)));
 
-    let taxes = WITHDRAWAL_TAXES.may_load(deps.as_mut().storage, "native:utest".to_string()).unwrap();
-    assert_eq!(taxes, None);
+    let balance = BALANCES.may_load(deps.as_mut().storage, "native:utest".to_string()).unwrap();
+    assert_eq!(balance, None);
   }
 }

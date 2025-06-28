@@ -27,7 +27,7 @@ pub enum ExecuteMsg {
   /// Receive a cw20 token with payload.
   Receive(cw20::Cw20ReceiveMsg),
 
-  /// Collect taxes for a given asset. Callable only by the admin.
+  /// Collect balances for a given asset. Callable only by the admin.
   CollectTaxes {
     asset: Asset,
   },

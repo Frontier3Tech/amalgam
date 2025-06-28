@@ -1,6 +1,6 @@
-use cosmwasm_std::{coin, to_json_binary, BankMsg, CosmosMsg, Decimal, Uint128, WasmMsg};
+use cosmwasm_std::{coin, to_json_binary, Addr, BankMsg, CosmosMsg, Decimal, Deps, QuerierWrapper, Uint128, WasmMsg};
 use cosmwasm_schema::cw_serde;
-use cw20::Cw20ExecuteMsg;
+use cw20::{Cw20Contract, Cw20ExecuteMsg};
 use cw_storage_plus::{Item, Map};
 
 #[cw_serde]
@@ -46,9 +46,23 @@ impl Asset {
         }.into(),
     }
   }
+
+  pub fn balance(&self, deps: &Deps, querier: &QuerierWrapper, address: Addr) -> Uint128 {
+    match self {
+      Asset::Native(denom) => {
+        let balance = querier.query_balance(address, denom);
+        balance.map_or(Uint128::zero(), |balance| balance.amount)
+      },
+      Asset::Cw20(contract) => {
+        let contract = deps.api.addr_validate(contract).unwrap();
+        let contract = Cw20Contract(contract);
+        contract.balance(querier, address).unwrap_or(Uint128::zero())
+      },
+    }
+  }
 }
 
 pub const STATE: Item<State> = Item::new("state");
 pub const COMPONENTS: Map<String, Component> = Map::new("components");
-/// Map of asset keys to amount of withdrawal taxes collected.
-pub const WITHDRAWAL_TAXES: Map<String, Uint128> = Map::new("withdrawal_taxes");
+/// Map of asset keys to balances.
+pub const BALANCES: Map<String, Uint128> = Map::new("balances");
