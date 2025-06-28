@@ -21,6 +21,9 @@ pub enum ContractError {
   #[error("Invalid fee must be between 0 and 10000")]
   InvalidWithdrawalFee,
 
+  #[error("No taxes")]
+  NoTaxes,
+
   // Add any other custom errors you like here.
   // Look at https://docs.rs/thiserror/1.0.21/thiserror/ for details.
 }

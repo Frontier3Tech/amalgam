@@ -185,7 +185,12 @@ fn withdraw(ctx: &mut ExecuteContext, asset: Asset) -> ContractResult<Response> 
 
 fn collect_taxes(ctx: &mut ExecuteContext, asset: Asset) -> ContractResult<Response> {
   let admin = helpers::assert_admin(ctx)?;
-  let taxes = WITHDRAWAL_TAXES.load(ctx.deps.storage, asset.key())?;
+
+  let taxes = WITHDRAWAL_TAXES.may_load(ctx.deps.storage, asset.key())?;
+  if taxes.is_none() {
+    return Err(ContractError::NoTaxes);
+  }
+  let taxes = taxes.unwrap();
 
   WITHDRAWAL_TAXES.remove(ctx.deps.storage, asset.key());
 
@@ -219,5 +224,121 @@ mod helpers {
     }
     // sender can never be an invalid address, so `.unwrap()` is safe
     Ok(ctx.deps.api.addr_validate(&state.admin).unwrap())
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  use cosmwasm_std::testing::{mock_dependencies, mock_env, mock_info};
+
+  use crate::state::State;
+
+  #[test]
+  fn test_add_component_non_admin() {
+    let mut deps = mock_dependencies();
+    let env = mock_env();
+    let info = mock_info("user", &[]);
+
+    let msg = ExecuteMsg::AddComponent(Component {
+      token: Asset::Native("uosmo".to_string()),
+      weight: Decimal::from_ratio(1u64, 100u64),
+      withdrawal_tax: 1000,
+    });
+
+    STATE.save(deps.as_mut().storage, &State {
+      admin: "admin".to_string(),
+    }).unwrap();
+
+    let res = execute(deps.as_mut(), env.clone(), info.clone(), msg.clone());
+    assert!(matches!(res, Err(ContractError::Unauthorized)));
+
+    let info = mock_info("admin", &[]);
+
+    let res = execute(deps.as_mut(), env.clone(), info.clone(), msg);
+    assert!(matches!(res, Ok(_)));
+
+    let component = COMPONENTS.load(deps.as_mut().storage, "native:uosmo".to_string()).unwrap();
+    assert_eq!(component.weight, Decimal::from_ratio(1u64, 100u64));
+    assert_eq!(component.withdrawal_tax, 1000);
+  }
+
+  #[test]
+  fn test_change_admin() {
+    let mut deps = mock_dependencies();
+    let env = mock_env();
+    let info = mock_info("user", &[]);
+
+    let msg = ExecuteMsg::UpdateAdmin {
+      admin: "new_admin".to_string(),
+    };
+
+    STATE.save(deps.as_mut().storage, &State {
+      admin: "admin".to_string(),
+    }).unwrap();
+
+    let res = execute(deps.as_mut(), env.clone(), info.clone(), msg.clone());
+    assert!(matches!(res, Err(ContractError::Unauthorized)));
+
+    let info = mock_info("admin", &[]);
+    let res = execute(deps.as_mut(), env.clone(), info.clone(), msg);
+    assert!(matches!(res, Ok(_)));
+
+    let state = STATE.load(deps.as_mut().storage).unwrap();
+    assert_eq!(state.admin, "new_admin".to_string());
+  }
+
+  #[test]
+  fn test_update_metadata() {
+    let mut deps = mock_dependencies();
+    let env = mock_env();
+    let info = mock_info("user", &[]);
+
+    let msg = ExecuteMsg::UpdateMetadata(UpdateMetadataMsg {
+      name: Some("new_name".to_string()),
+      description: Some("new_description".to_string()),
+      uri: Some("new_uri".to_string()),
+      uri_hash: Some("new_uri_hash".to_string()),
+    });
+
+    STATE.save(deps.as_mut().storage, &State {
+      admin: "admin".to_string(),
+    }).unwrap();
+
+    let res = execute(deps.as_mut(), env.clone(), info.clone(), msg.clone());
+    assert!(matches!(res, Err(ContractError::Unauthorized)));
+
+    // NOTE: cannot update metadata w/o an actual chain, bank module mock is insufficient
+  }
+
+  #[test]
+  fn test_collect_taxes() {
+    let mut deps = mock_dependencies();
+    let env = mock_env();
+    let info = mock_info("user", &[]);
+
+    let msg = ExecuteMsg::CollectTaxes {
+      asset: Asset::Native("utest".to_string()),
+    };
+
+    STATE.save(deps.as_mut().storage, &State {
+      admin: "admin".to_string(),
+    }).unwrap();
+
+    let res = execute(deps.as_mut(), env.clone(), info.clone(), msg.clone());
+    assert!(matches!(res, Err(ContractError::Unauthorized)));
+
+    let info = mock_info("admin", &[]);
+    let res = execute(deps.as_mut(), env.clone(), info.clone(), msg.clone());
+    assert!(matches!(res, Err(ContractError::NoTaxes)));
+
+    WITHDRAWAL_TAXES.save(deps.as_mut().storage, "native:utest".to_string(), &Uint128::from(1000u64)).unwrap();
+
+    let res = execute(deps.as_mut(), env.clone(), info.clone(), msg);
+    assert!(matches!(res, Ok(_)));
+
+    let taxes = WITHDRAWAL_TAXES.may_load(deps.as_mut().storage, "native:utest".to_string()).unwrap();
+    assert_eq!(taxes, None);
   }
 }
