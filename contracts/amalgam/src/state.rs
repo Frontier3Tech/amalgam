@@ -14,7 +14,7 @@ pub struct Component {
   pub token: Asset,
   pub weight: Decimal,
   /// In basis points.
-  pub withdrawal_fee: u16,
+  pub withdrawal_tax: u16,
 }
 
 #[cw_serde]
@@ -50,3 +50,5 @@ impl Asset {
 
 pub const STATE: Item<State> = Item::new("state");
 pub const COMPONENTS: Map<String, Component> = Map::new("components");
+/// Map of asset keys to amount of withdrawal taxes collected.
+pub const WITHDRAWAL_TAXES: Map<String, Uint128> = Map::new("withdrawal_taxes");

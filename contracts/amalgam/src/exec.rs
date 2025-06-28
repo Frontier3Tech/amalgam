@@ -5,9 +5,9 @@ use cosmwasm_std::{from_json, Addr, Decimal, DepsMut, Env, Fraction, MessageInfo
 use crate::contract::get_tftoken;
 use crate::{ContractError, ContractResult};
 use crate::msg::{Cw20ReceivePayload, ExecuteMsg, UpdateMetadataMsg};
-use crate::state::{Asset, Component, COMPONENTS};
+use crate::state::{Asset, Component, COMPONENTS, STATE, WITHDRAWAL_TAXES};
 
-use amalgam_utils::tokenfactory::{self, DenomMetadata, DenomUnit, TFToken};
+use amalgam_utils::tokenfactory::{DenomMetadata, DenomUnit, TFToken};
 
 struct ExecuteContext<'a> {
   deps: DepsMut<'a>,
@@ -45,10 +45,16 @@ pub fn execute(
       deposit_native(&mut ctx),
     ExecuteMsg::Withdraw { asset } =>
       withdraw(&mut ctx, asset),
+    ExecuteMsg::CollectTaxes { asset } =>
+      collect_taxes(&mut ctx, asset),
+    ExecuteMsg::UpdateAdmin { admin } =>
+      update_admin(&mut ctx, admin),
   }
 }
 
 fn add_component(ctx: &mut ExecuteContext, component: Component) -> ContractResult<Response> {
+  helpers::assert_admin(ctx)?;
+
   let key = match component.token.clone() {
     Asset::Native(denom) => {
       let key = format!("native:{}", denom);
@@ -68,7 +74,7 @@ fn add_component(ctx: &mut ExecuteContext, component: Component) -> ContractResu
     }
   };
 
-  if component.withdrawal_fee > 10000 {
+  if component.withdrawal_tax > 10000 {
     return Err(ContractError::InvalidWithdrawalFee);
   }
 
@@ -80,11 +86,9 @@ fn add_component(ctx: &mut ExecuteContext, component: Component) -> ContractResu
 }
 
 fn update_metadata(ctx: &mut ExecuteContext, metadata: UpdateMetadataMsg) -> ContractResult<Response> {
-  let tftoken = tokenfactory::osmosis::TFToken::new(
-    ctx.env.contract.address.clone(),
-    "amalgam".to_string(),
-  );
+  helpers::assert_admin(ctx)?;
 
+  let tftoken = get_tftoken(&ctx.env);
   let existing = ctx.deps.querier.query_denom_metadata(tftoken.denom())?;
 
   let new_metadata = DenomMetadata {
@@ -157,14 +161,19 @@ fn withdraw(ctx: &mut ExecuteContext, asset: Asset) -> ContractResult<Response> 
   }
   let component = component.unwrap();
 
-  let withdrawal_fee_decimal = Decimal::from_ratio(component.withdrawal_fee as u64, 10000u64);
+  let withdrawal_tax_decimal = Decimal::from_ratio(component.withdrawal_tax as u64, 10000u64);
 
   // invert mint weight
   let amount = fund.amount * Decimal::inv(&component.weight).unwrap();
-  // apply withdrawal fee
-  let amount = amount * (Decimal::one() - withdrawal_fee_decimal);
-  // subtract one to make sure we don't run out of funds due to precision loss
-  let amount = amount - Uint128::one();
+  // compute withdrawal tax
+  let tax = amount * withdrawal_tax_decimal;
+  // apply withdrawal tax & subtract one to make sure we don't run out of funds due to precision loss
+  let amount = amount - tax - Uint128::one();
+
+  // update collected withdrawal taxes
+  WITHDRAWAL_TAXES.update(ctx.deps.storage, asset.key(), |fees| -> Result<Uint128, ContractError> {
+    Ok(fees.unwrap_or(Uint128::zero()) + tax)
+  })?;
 
   Ok(Response::new()
     .add_attribute("action", "withdraw")
@@ -172,4 +181,43 @@ fn withdraw(ctx: &mut ExecuteContext, asset: Asset) -> ContractResult<Response> 
     .add_messages(tftoken.burn(fund.amount, ctx.env.contract.address.to_string()))
     .add_message(asset.send(amount, ctx.info.sender.to_string()))
   )
+}
+
+fn collect_taxes(ctx: &mut ExecuteContext, asset: Asset) -> ContractResult<Response> {
+  let admin = helpers::assert_admin(ctx)?;
+  let taxes = WITHDRAWAL_TAXES.load(ctx.deps.storage, asset.key())?;
+
+  WITHDRAWAL_TAXES.remove(ctx.deps.storage, asset.key());
+
+  Ok(Response::new()
+    .add_attribute("action", "collect_taxes")
+    .add_message(asset.send(taxes, admin.to_string()))
+  )
+}
+
+fn update_admin(ctx: &mut ExecuteContext, admin: String) -> ContractResult<Response> {
+  STATE.update(ctx.deps.storage, |mut state| {
+    if ctx.info.sender != state.admin {
+      return Err(ContractError::Unauthorized);
+    }
+    state.admin = admin.clone();
+    Ok(state)
+  })?;
+  Ok(Response::new()
+    .add_attribute("action", "update_admin")
+    .add_attribute("new_admin", admin)
+  )
+}
+
+mod helpers {
+  use super::*;
+
+  pub fn assert_admin(ctx: &mut ExecuteContext) -> ContractResult<Addr> {
+    let state = STATE.load(ctx.deps.storage)?;
+    if ctx.info.sender != state.admin {
+      return Err(ContractError::Unauthorized);
+    }
+    // sender can never be an invalid address, so `.unwrap()` is safe
+    Ok(ctx.deps.api.addr_validate(&state.admin).unwrap())
+  }
 }
